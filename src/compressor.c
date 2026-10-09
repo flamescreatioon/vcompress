@@ -500,3 +500,129 @@ bool huffman_decode_symbol(BitReader *reader, const HuffmanTable *table, uint16_
     }
     return false;
 }
+
+/* -------------------------------------------------------------
+ * In-Loop Deblocking Filter
+ * ------------------------------------------------------------- */
+
+void deblock_filter_plane(uint8_t *plane, uint32_t stride, uint32_t width, uint32_t height, int quality) {
+    if (!plane || width < 16 || height < 16 || quality >= 98) {
+        return;
+    }
+
+    int qp_proxy = 100 - quality;
+    if (qp_proxy < 1) qp_proxy = 1;
+
+    /* Adaptive filtering thresholds based on quantization strength */
+    int alpha = 4 + (qp_proxy >> 2);     /* Boundary difference threshold */
+    int beta  = 2 + (qp_proxy >> 3);     /* Internal surface flatness threshold */
+    int max_c = 1 + (qp_proxy >> 4);     /* Maximum boundary sample adjustment */
+    int max_c_inner = max_c >> 1;
+
+    /* 1. Filter Vertical 8x8 block edges */
+    for (uint32_t bx = BLOCK_SIZE; bx < width; bx += BLOCK_SIZE) {
+        for (uint32_t y = 0; y < height; y++) {
+            uint8_t *row = plane + (size_t)y * stride;
+
+            int p0 = (int)row[bx - 1];
+            int p1 = (int)row[bx - 2];
+            int p2 = (bx >= 3) ? (int)row[bx - 3] : p1;
+
+            int q0 = (int)row[bx];
+            int q1 = (bx + 1 < width) ? (int)row[bx + 1] : q0;
+            int q2 = (bx + 2 < width) ? (int)row[bx + 2] : q1;
+
+            int d0 = abs(p0 - q0);
+            if (d0 == 0 || d0 >= alpha) continue;
+
+            int dp = abs(p1 - p0);
+            int dq = abs(q1 - q0);
+            if (dp >= beta || dq >= beta) continue;
+
+            /* Filter boundary samples p0 and q0 */
+            int delta = (4 * (q0 - p0) + (p1 - q1) + 4) >> 3;
+            if (delta > max_c) delta = max_c;
+            else if (delta < -max_c) delta = -max_c;
+
+            row[bx - 1] = utils_clamp_u8(p0 + delta);
+            row[bx]     = utils_clamp_u8(q0 - delta);
+
+            /* Filter inner samples p1 and q1 if regions are exceptionally flat */
+            if (max_c_inner > 0) {
+                if (abs(p2 - p0) < beta) {
+                    int delta_p = (p2 + ((p0 + q0 + 1) >> 1) - 2 * p1) >> 1;
+                    if (delta_p > max_c_inner) delta_p = max_c_inner;
+                    else if (delta_p < -max_c_inner) delta_p = -max_c_inner;
+                    row[bx - 2] = utils_clamp_u8(p1 + delta_p);
+                }
+                if (abs(q2 - q0) < beta && (bx + 1 < width)) {
+                    int delta_q = (q2 + ((p0 + q0 + 1) >> 1) - 2 * q1) >> 1;
+                    if (delta_q > max_c_inner) delta_q = max_c_inner;
+                    else if (delta_q < -max_c_inner) delta_q = -max_c_inner;
+                    row[bx + 1] = utils_clamp_u8(q1 + delta_q);
+                }
+            }
+        }
+    }
+
+    /* 2. Filter Horizontal 8x8 block edges */
+    for (uint32_t by = BLOCK_SIZE; by < height; by += BLOCK_SIZE) {
+        uint8_t *row_p0 = plane + (size_t)(by - 1) * stride;
+        uint8_t *row_p1 = plane + (size_t)(by - 2) * stride;
+        uint8_t *row_p2 = (by >= 3) ? plane + (size_t)(by - 3) * stride : row_p1;
+
+        uint8_t *row_q0 = plane + (size_t)by * stride;
+        uint8_t *row_q1 = (by + 1 < height) ? plane + (size_t)(by + 1) * stride : row_q0;
+        uint8_t *row_q2 = (by + 2 < height) ? plane + (size_t)(by + 2) * stride : row_q1;
+
+        for (uint32_t x = 0; x < width; x++) {
+            int p0 = (int)row_p0[x];
+            int p1 = (int)row_p1[x];
+            int p2 = (int)row_p2[x];
+
+            int q0 = (int)row_q0[x];
+            int q1 = (int)row_q1[x];
+            int q2 = (int)row_q2[x];
+
+            int d0 = abs(p0 - q0);
+            if (d0 == 0 || d0 >= alpha) continue;
+
+            int dp = abs(p1 - p0);
+            int dq = abs(q1 - q0);
+            if (dp >= beta || dq >= beta) continue;
+
+            /* Filter boundary samples p0 and q0 */
+            int delta = (4 * (q0 - p0) + (p1 - q1) + 4) >> 3;
+            if (delta > max_c) delta = max_c;
+            else if (delta < -max_c) delta = -max_c;
+
+            row_p0[x] = utils_clamp_u8(p0 + delta);
+            row_q0[x] = utils_clamp_u8(q0 - delta);
+
+            /* Filter inner samples p1 and q1 if regions are exceptionally flat */
+            if (max_c_inner > 0) {
+                if (abs(p2 - p0) < beta) {
+                    int delta_p = (p2 + ((p0 + q0 + 1) >> 1) - 2 * p1) >> 1;
+                    if (delta_p > max_c_inner) delta_p = max_c_inner;
+                    else if (delta_p < -max_c_inner) delta_p = -max_c_inner;
+                    row_p1[x] = utils_clamp_u8(p1 + delta_p);
+                }
+                if (abs(q2 - q0) < beta && (by + 1 < height)) {
+                    int delta_q = (q2 + ((p0 + q0 + 1) >> 1) - 2 * q1) >> 1;
+                    if (delta_q > max_c_inner) delta_q = max_c_inner;
+                    else if (delta_q < -max_c_inner) delta_q = -max_c_inner;
+                    row_q1[x] = utils_clamp_u8(q1 + delta_q);
+                }
+            }
+        }
+    }
+}
+
+void deblock_filter_frame(Frame *frame, int quality) {
+    if (!frame) return;
+    int planes = (frame->format == PIX_FMT_RGB24) ? 1 : 3;
+    for (int p = 0; p < planes; p++) {
+        deblock_filter_plane(frame->data[p], frame->stride[p],
+                             frame->plane_width[p], frame->plane_height[p], quality);
+    }
+}

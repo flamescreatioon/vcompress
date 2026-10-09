@@ -360,6 +360,9 @@ bool encoder_encode_frame(VideoEncoder *enc, const Frame *frame, Buffer *out_pac
         free(blocks);
     }
 
+    /* Apply in-loop deblocking filter on reconstructed reference frame */
+    deblock_filter_frame(enc->ref_frame, enc->config.quality);
+
     if (conv_frame) frame_destroy(conv_frame);
     enc->frame_index++;
     return true;

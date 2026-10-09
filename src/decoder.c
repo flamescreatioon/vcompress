@@ -180,6 +180,9 @@ Frame *decoder_decode_frame(VideoDecoder *dec, const uint8_t *packet_data, size_
         bit_reader_align_byte(&reader);
     }
 
+    /* Apply in-loop deblocking filter on reconstructed reference frame */
+    deblock_filter_frame(dec->ref_frame, dec->quality);
+
     if (dec->format != dec->internal_format) {
         return frame_convert(dec->ref_frame, dec->format);
     }

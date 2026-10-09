@@ -388,6 +388,57 @@ static bool test_encoder_decoder_roundtrip(void) {
     return true;
 }
 
+static bool test_deblock_filter(void) {
+    /* Test 1: Artificial 8x8 block boundary step should be smoothed */
+    uint8_t plane[16 * 16];
+    uint32_t stride = 16;
+    uint32_t width = 16;
+    uint32_t height = 16;
+
+    /* Fill left 8x8 block with 100 and right 8x8 block with 108 */
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < 8; x++) {
+            plane[y * stride + x] = 100;
+        }
+        for (uint32_t x = 8; x < 16; x++) {
+            plane[y * stride + x] = 108;
+        }
+    }
+
+    deblock_filter_plane(plane, stride, width, height, 50);
+
+    /* Boundary pixels (x=7 and x=8) must be smoothed closer together */
+    uint8_t p0_smoothed = plane[4 * stride + 7];
+    uint8_t q0_smoothed = plane[4 * stride + 8];
+    TEST_ASSERT(p0_smoothed > 100, "Left boundary pixel smoothed upward");
+    TEST_ASSERT(q0_smoothed < 108, "Right boundary pixel smoothed downward");
+    TEST_ASSERT((q0_smoothed - p0_smoothed) < 8, "Boundary discontinuity reduced");
+
+    /* Test 2: Natural sharp edge (> alpha) must be preserved without blurring */
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < 8; x++) {
+            plane[y * stride + x] = 50;
+        }
+        for (uint32_t x = 8; x < 16; x++) {
+            plane[y * stride + x] = 220;
+        }
+    }
+
+    deblock_filter_plane(plane, stride, width, height, 50);
+
+    TEST_ASSERT(plane[4 * stride + 7] == 50, "Sharp edge left preserved");
+    TEST_ASSERT(plane[4 * stride + 8] == 220, "Sharp edge right preserved");
+
+    /* Test 3: Frame-level wrapper safety */
+    Frame *test_frame = frame_create(32, 32, PIX_FMT_YUV420);
+    TEST_ASSERT(test_frame != NULL, "Frame created for deblock test");
+    deblock_filter_frame(test_frame, 60);
+    deblock_filter_frame(NULL, 60);
+    frame_destroy(test_frame);
+
+    return true;
+}
+
 int main(void) {
     printf("==========================================\n");
     printf("  vcompress Automated Unit Test Suite\n");
@@ -402,6 +453,7 @@ int main(void) {
     RUN_TEST(test_rle_and_huffman);
     RUN_TEST(test_vc_container);
     RUN_TEST(test_thread_pool);
+    RUN_TEST(test_deblock_filter);
     RUN_TEST(test_encoder_decoder_roundtrip);
 
     printf("\n------------------------------------------\n");

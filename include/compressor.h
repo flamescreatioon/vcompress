@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "buffer.h"
+#include "frame.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,6 +90,16 @@ BufferError huffman_encode_symbol(BitWriter *writer, const HuffmanTable *table, 
 
 /* Decode symbol from bitstream using Huffman table */
 bool huffman_decode_symbol(BitReader *reader, const HuffmanTable *table, uint16_t *out_symbol);
+
+/* -------------------------------------------------------------
+ * In-Loop Deblocking Filter
+ * ------------------------------------------------------------- */
+
+/* Apply in-loop deblocking filter on a single planar component across 8x8 block boundaries */
+void deblock_filter_plane(uint8_t *plane, uint32_t stride, uint32_t width, uint32_t height, int quality);
+
+/* Apply in-loop deblocking filter across all planes of a reconstructed frame */
+void deblock_filter_frame(Frame *frame, int quality);
 
 #ifdef __cplusplus
 }
