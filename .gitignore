@@ -1,0 +1,32 @@
+# Build artifacts
+*.o
+*.obj
+*.exe
+vcompress
+tests/test_runner
+tests/test_diagnostic
+examples/generate_sample
+
+# Intermediate test and media files
+*.vc
+*.y4m
+*.mp4
+*.MP4
+*.m4v
+*.mov
+*.avi
+*.h264
+*.264
+
+# Scratch and log files
+scratch*
+*.log
+
+# IDE and OS files
+.vscode/
+.idea/
+.claude/
+*.swp
+*~
+.DS_Store
+Thumbs.db
