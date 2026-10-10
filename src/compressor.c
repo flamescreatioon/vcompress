@@ -206,26 +206,80 @@ void quant_matrix_init(uint16_t qmatrix[BLOCK_AREA], const uint8_t base_matrix[B
     }
 }
 
-void quantize_block(const int32_t in_coeff[BLOCK_AREA], const uint16_t qmatrix[BLOCK_AREA], int16_t out_quant[BLOCK_AREA]) {
+uint32_t calc_block_variance_u8(const uint8_t *pixels, uint32_t stride, uint32_t width, uint32_t height, uint32_t px0, uint32_t py0) {
+    if (!pixels) return 0;
+
+    int32_t sum = 0;
+    for (uint32_t y = 0; y < BLOCK_SIZE; y++) {
+        uint32_t py = (py0 + y < height) ? (py0 + y) : (height - 1);
+        const uint8_t *row = pixels + (size_t)py * stride;
+        for (uint32_t x = 0; x < BLOCK_SIZE; x++) {
+            uint32_t px = (px0 + x < width) ? (px0 + x) : (width - 1);
+            sum += (int32_t)row[px];
+        }
+    }
+
+    int32_t mean = (sum + (BLOCK_AREA / 2)) / BLOCK_AREA;
+    int64_t diff_sq = 0;
+
+    for (uint32_t y = 0; y < BLOCK_SIZE; y++) {
+        uint32_t py = (py0 + y < height) ? (py0 + y) : (height - 1);
+        const uint8_t *row = pixels + (size_t)py * stride;
+        for (uint32_t x = 0; x < BLOCK_SIZE; x++) {
+            uint32_t px = (px0 + x < width) ? (px0 + x) : (width - 1);
+            int32_t d = (int32_t)row[px] - mean;
+            diff_sq += (int64_t)d * d;
+        }
+    }
+
+    return (uint32_t)(diff_sq / BLOCK_AREA);
+}
+
+void quantize_block_aq(const int32_t in_coeff[BLOCK_AREA], const uint16_t qmatrix[BLOCK_AREA],
+                       uint32_t variance, int16_t out_quant[BLOCK_AREA]) {
     /* DC coefficient: standard mid-tread rounding to preserve mean luminance */
     int32_t c0 = in_coeff[0];
     int32_t q0 = (int32_t)qmatrix[0];
     out_quant[0] = (int16_t)((c0 >= 0) ? ((c0 + (q0 / 2)) / q0) : ((c0 - (q0 / 2)) / q0));
 
-    /* AC coefficients: dead-zone quantization (dead-zone threshold = 5/8 * q)
-     * Suppresses high-frequency quantization noise and extends zero-runs for superior RLE efficiency */
+    /* AC coefficients: Adaptive Quantization (AQ) dead-zone thresholding.
+     * Modulates dead-zone threshold and rounding offset based on local spatial variance:
+     * - Flat/smooth gradient blocks (variance < 25): narrow dead-zone (3/8 * q) to retain
+     *   subtle gradient harmonics and eliminate false contouring (color banding).
+     * - Textured/complex blocks (variance > 140): wide dead-zone (6/8 * q) to eliminate
+     *   imperceptible noise masked by high-frequency energy, boosting compression ratio.
+     * - Standard blocks: balanced dead-zone (5/8 * q). */
+    int32_t thresh_num;
+    int32_t offset_num;
+
+    if (variance < 25) {
+        thresh_num = 3; /* 3/8 * q: narrower dead-zone preserves gradient continuity */
+        offset_num = 4; /* 4/8 * q: mid-tread rounding */
+    } else if (variance > 140) {
+        thresh_num = 6; /* 6/8 * q: wider dead-zone for texture masking */
+        offset_num = 2; /* 2/8 * q: aggressive noise truncation */
+    } else {
+        thresh_num = 5; /* 5/8 * q: balanced default dead-zone */
+        offset_num = 3; /* 3/8 * q */
+    }
+
     for (int i = 1; i < BLOCK_AREA; i++) {
         int32_t c = in_coeff[i];
         int32_t q = (int32_t)qmatrix[i];
         int32_t abs_c = (c < 0) ? -c : c;
-        int32_t thresh = (q * 5) / 8;
+        int32_t thresh = (q * thresh_num) / 8;
+
         if (abs_c < thresh) {
             out_quant[i] = 0;
         } else {
-            int32_t val = (abs_c + (q * 3) / 8) / q;
+            int32_t val = (abs_c + (q * offset_num) / 8) / q;
             out_quant[i] = (int16_t)((c < 0) ? -val : val);
         }
     }
+}
+
+void quantize_block(const int32_t in_coeff[BLOCK_AREA], const uint16_t qmatrix[BLOCK_AREA], int16_t out_quant[BLOCK_AREA]) {
+    quantize_block_aq(in_coeff, qmatrix, 64, out_quant);
 }
 
 void dequantize_block(const int16_t in_quant[BLOCK_AREA], const uint16_t qmatrix[BLOCK_AREA], int32_t out_coeff[BLOCK_AREA]) {

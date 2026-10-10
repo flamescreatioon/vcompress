@@ -74,6 +74,7 @@ typedef struct BlockTaskArgs {
     const uint16_t *qmatrix;
     bool is_p_frame;
     int inter_threshold;
+    uint32_t lambda;
     uint32_t block_x_start;
     uint32_t block_x_end;
     uint32_t block_y;
@@ -98,9 +99,14 @@ static void process_block_row(void *arg) {
         uint32_t px0 = bx * BLOCK_SIZE;
         uint32_t py0 = by * BLOCK_SIZE;
 
-        /* Check for P-frame motion/change detection */
+        /* Calculate block spatial variance for Adaptive Quantization (AQ) */
+        uint32_t block_var = calc_block_variance_u8(args->cur_plane, args->cur_stride,
+                                                    args->plane_w, args->plane_h, px0, py0);
+
+        /* P-Frame Rate-Distortion Optimization (RDO) */
         if (args->is_p_frame) {
-            uint32_t sad = 0;
+            /* 1. Calculate Distortion for SKIP mode: Sum of Squared Errors (SSE) */
+            uint64_t sse_skip = 0;
             for (uint32_t y = 0; y < BLOCK_SIZE; y++) {
                 uint32_t py = (py0 + y < args->plane_h) ? (py0 + y) : (args->plane_h - 1);
                 const uint8_t *cur_row = args->cur_plane + (size_t)py * args->cur_stride;
@@ -108,41 +114,117 @@ static void process_block_row(void *arg) {
 
                 for (uint32_t x = 0; x < BLOCK_SIZE; x++) {
                     uint32_t px = (px0 + x < args->plane_w) ? (px0 + x) : (args->plane_w - 1);
-                    int32_t d = (int32_t)cur_row[px] - (int32_t)ref_row[px];
-                    sad += (uint32_t)(d >= 0 ? d : -d);
+                    int32_t diff = (int32_t)cur_row[px] - (int32_t)ref_row[px];
+                    sse_skip += (uint64_t)(diff * diff);
+                    raw_block[y * BLOCK_SIZE + x] = (int16_t)diff;
                 }
             }
 
-            if (sad <= (uint32_t)args->inter_threshold) {
+            /* Fast skip: if block is identical or within skip tolerance */
+            if (sse_skip == 0 || sse_skip <= (uint64_t)args->inter_threshold) {
                 bd->skip = 1;
                 memset(bd->zigzag, 0, sizeof(bd->zigzag));
                 continue;
             }
+
+            /* 2. Candidate Transform & Adaptive Quantization (AQ) */
+            dct_8x8_fast(raw_block, dct_coeff);
+            quantize_block_aq(dct_coeff, args->qmatrix, block_var, quant_coeff);
+
+            /* Check if all AC & DC coefficients quantized to zero */
+            bool all_zero = true;
+            for (int i = 0; i < BLOCK_AREA; i++) {
+                if (quant_coeff[i] != 0) {
+                    all_zero = false;
+                    break;
+                }
+            }
+
+            if (all_zero) {
+                /* Quantization eliminated entire residual: skip costs 1 bit vs transmitting empty block */
+                bd->skip = 1;
+                memset(bd->zigzag, 0, sizeof(bd->zigzag));
+                continue;
+            }
+
+            /* 3. Reconstruct candidate block and evaluate Distortion for CODED mode */
+            dequantize_block(quant_coeff, args->qmatrix, dequant_coeff);
+            idct_8x8_fast(dequant_coeff, recon_block);
+
+            uint64_t sse_coded = 0;
+            for (uint32_t y = 0; y < BLOCK_SIZE; y++) {
+                uint32_t py = (py0 + y < args->plane_h) ? (py0 + y) : (args->plane_h - 1);
+                const uint8_t *cur_row = args->cur_plane + (size_t)py * args->cur_stride;
+                const uint8_t *ref_row = args->ref_plane + (size_t)py * args->ref_stride;
+
+                for (uint32_t x = 0; x < BLOCK_SIZE; x++) {
+                    uint32_t px = (px0 + x < args->plane_w) ? (px0 + x) : (args->plane_w - 1);
+                    int32_t recon_val = utils_clamp_u8((int32_t)ref_row[px] + recon_block[y * BLOCK_SIZE + x]);
+                    int32_t diff = (int32_t)cur_row[px] - recon_val;
+                    sse_coded += (uint64_t)(diff * diff);
+                }
+            }
+
+            /* 4. Estimate Bitrate (R) for CODED mode */
+            zigzag_reorder(quant_coeff, bd->zigzag);
+            RLESymbol candidate_syms[MAX_BLOCK_SYMBOLS];
+            size_t n_syms = rle_encode_block(bd->zigzag, candidate_syms, MAX_BLOCK_SYMBOLS);
+
+            uint32_t rate_bits = 1; /* 1 bit for skip=0 header */
+            for (size_t s = 0; s < n_syms; s++) {
+                int16_t v = candidate_syms[s].value;
+                uint8_t cat = 0;
+                if (v != 0) {
+                    int32_t abs_v = (v < 0) ? -v : v;
+                    while (abs_v > 0) {
+                        cat++;
+                        abs_v >>= 1;
+                    }
+                }
+                rate_bits += 4 + (uint32_t)cat; /* ~4 bits for Huffman symbol + magnitude bits */
+            }
+
+            /* 5. Lagrangian Cost Evaluation: J = D + lambda * R */
+            uint64_t cost_skip = sse_skip + (uint64_t)args->lambda * 1;
+            uint64_t cost_coded = sse_coded + (uint64_t)args->lambda * (uint64_t)rate_bits;
+
+            if (cost_skip <= cost_coded) {
+                /* Lagrangian RDO favors SKIP */
+                bd->skip = 1;
+                memset(bd->zigzag, 0, sizeof(bd->zigzag));
+                continue;
+            }
+
+            /* Lagrangian RDO favors CODED */
+            bd->skip = 0;
+            for (uint32_t y = 0; y < BLOCK_SIZE; y++) {
+                uint32_t py = py0 + y;
+                if (py >= args->plane_h) continue;
+                uint8_t *ref_row = args->ref_plane + (size_t)py * args->ref_stride;
+                for (uint32_t x = 0; x < BLOCK_SIZE; x++) {
+                    uint32_t px = px0 + x;
+                    if (px >= args->plane_w) continue;
+                    ref_row[px] = utils_clamp_u8((int32_t)ref_row[px] + recon_block[y * BLOCK_SIZE + x]);
+                }
+            }
+            continue;
         }
 
+        /* Intra Frame block */
         bd->skip = 0;
-
-        /* Extract 8x8 samples (level shifted for I-frame, residual for P-frame) */
         for (uint32_t y = 0; y < BLOCK_SIZE; y++) {
             uint32_t py = (py0 + y < args->plane_h) ? (py0 + y) : (args->plane_h - 1);
             const uint8_t *cur_row = args->cur_plane + (size_t)py * args->cur_stride;
-            const uint8_t *ref_row = args->ref_plane + (size_t)py * args->ref_stride;
 
             for (uint32_t x = 0; x < BLOCK_SIZE; x++) {
                 uint32_t px = (px0 + x < args->plane_w) ? (px0 + x) : (args->plane_w - 1);
-                if (args->is_p_frame) {
-                    /* Residual */
-                    raw_block[y * BLOCK_SIZE + x] = (int16_t)((int32_t)cur_row[px] - (int32_t)ref_row[px]);
-                } else {
-                    /* Intra: zero-centered */
-                    raw_block[y * BLOCK_SIZE + x] = (int16_t)((int32_t)cur_row[px] - 128);
-                }
+                raw_block[y * BLOCK_SIZE + x] = (int16_t)((int32_t)cur_row[px] - 128);
             }
         }
 
-        /* 2D DCT -> Quantize -> Zigzag */
+        /* 2D DCT -> Adaptive Quantization (AQ) -> Zigzag */
         dct_8x8_fast(raw_block, dct_coeff);
-        quantize_block(dct_coeff, args->qmatrix, quant_coeff);
+        quantize_block_aq(dct_coeff, args->qmatrix, block_var, quant_coeff);
         zigzag_reorder(quant_coeff, bd->zigzag);
 
         /* Reconstruct local reference block to keep encoder & decoder synchronized */
@@ -158,12 +240,7 @@ static void process_block_row(void *arg) {
                 uint32_t px = px0 + x;
                 if (px >= args->plane_w) continue;
 
-                int32_t val = recon_block[y * BLOCK_SIZE + x];
-                if (args->is_p_frame) {
-                    val += (int32_t)ref_row[px];
-                } else {
-                    val += 128;
-                }
+                int32_t val = (int32_t)recon_block[y * BLOCK_SIZE + x] + 128;
                 ref_row[px] = utils_clamp_u8(val);
             }
         }
@@ -216,6 +293,17 @@ bool encoder_encode_frame(VideoEncoder *enc, const Frame *frame, Buffer *out_pac
 
         const uint16_t *qmat = (p == 0) ? enc->qmatrix_luma : enc->qmatrix_chroma;
 
+        /* Calculate Lagrangian lambda for Rate-Distortion Optimization (RDO)
+         * lambda is proportional to average quantization step squared */
+        uint64_t q_sum = 0;
+        for (int i = 0; i < BLOCK_AREA; i++) {
+            q_sum += qmat[i];
+        }
+        uint32_t q_avg = (uint32_t)(q_sum / BLOCK_AREA);
+        if (q_avg < 1) q_avg = 1;
+        uint32_t lambda = (q_avg * q_avg) / 16;
+        if (lambda < 1) lambda = 1;
+
         if (enc->pool) {
             BlockTaskArgs *args_list = (BlockTaskArgs *)malloc(num_blocks_y * sizeof(BlockTaskArgs));
             for (uint32_t by = 0; by < num_blocks_y; by++) {
@@ -229,6 +317,7 @@ bool encoder_encode_frame(VideoEncoder *enc, const Frame *frame, Buffer *out_pac
                 args->qmatrix = qmat;
                 args->is_p_frame = !keyframe;
                 args->inter_threshold = enc->config.inter_threshold;
+                args->lambda = lambda;
                 args->block_x_start = 0;
                 args->block_x_end = num_blocks_x;
                 args->block_y = by;
@@ -251,6 +340,7 @@ bool encoder_encode_frame(VideoEncoder *enc, const Frame *frame, Buffer *out_pac
                 args.qmatrix = qmat;
                 args.is_p_frame = !keyframe;
                 args.inter_threshold = enc->config.inter_threshold;
+                args.lambda = lambda;
                 args.block_x_start = 0;
                 args.block_x_end = num_blocks_x;
                 args.block_y = by;

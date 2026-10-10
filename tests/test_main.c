@@ -439,6 +439,51 @@ static bool test_deblock_filter(void) {
     return true;
 }
 
+static bool test_adaptive_quantization(void) {
+    /* 1. Test block variance calculation */
+    uint8_t buf[64];
+    memset(buf, 128, sizeof(buf));
+    uint32_t var_flat = calc_block_variance_u8(buf, 8, 8, 8, 0, 0);
+    TEST_ASSERT(var_flat == 0, "Flat block has zero variance");
+
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            buf[y * 8 + x] = (uint8_t)(100 + x);
+        }
+    }
+    uint32_t var_grad = calc_block_variance_u8(buf, 8, 8, 8, 0, 0);
+    TEST_ASSERT(var_grad > 0 && var_grad < 25, "Subtle gradient has low variance (<25)");
+
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            buf[y * 8 + x] = ((x + y) % 2 == 0) ? 20 : 220;
+        }
+    }
+    uint32_t var_noisy = calc_block_variance_u8(buf, 8, 8, 8, 0, 0);
+    TEST_ASSERT(var_noisy > 150, "Checkerboard has high variance (>150)");
+
+    /* 2. Test Dead-Zone Threshold Modulation */
+    uint16_t qmatrix[BLOCK_AREA];
+    for (int i = 0; i < BLOCK_AREA; i++) qmatrix[i] = 16; /* q = 16 for all frequencies */
+
+    int32_t coeffs[BLOCK_AREA] = {0};
+    /* AC coefficient = 8 (between 3/8*16=6 and 5/8*16=10) */
+    coeffs[1] = 8;
+
+    int16_t quant_flat[BLOCK_AREA];
+    int16_t quant_textured[BLOCK_AREA];
+
+    /* In low variance: threshold is 3/8*16 = 6. 8 >= 6, so coefficient is retained */
+    quantize_block_aq(coeffs, qmatrix, var_grad, quant_flat);
+    TEST_ASSERT(quant_flat[1] != 0, "Subtle gradient AC coefficient survives AQ in smooth area");
+
+    /* In high variance: threshold is 6/8*16 = 12. 8 < 12, so noise is truncated to 0 */
+    quantize_block_aq(coeffs, qmatrix, var_noisy, quant_textured);
+    TEST_ASSERT(quant_textured[1] == 0, "Noise AC coefficient is pruned by AQ in textured area");
+
+    return true;
+}
+
 int main(void) {
     printf("==========================================\n");
     printf("  vcompress Automated Unit Test Suite\n");
@@ -454,6 +499,7 @@ int main(void) {
     RUN_TEST(test_vc_container);
     RUN_TEST(test_thread_pool);
     RUN_TEST(test_deblock_filter);
+    RUN_TEST(test_adaptive_quantization);
     RUN_TEST(test_encoder_decoder_roundtrip);
 
     printf("\n------------------------------------------\n");

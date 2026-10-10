@@ -34,8 +34,12 @@ void idct_8x8_fast(const int32_t input[BLOCK_AREA], int16_t output[BLOCK_AREA]);
 /* Generate scaled quantization matrix for given quality (1-100) */
 void quant_matrix_init(uint16_t qmatrix[BLOCK_AREA], const uint8_t base_matrix[BLOCK_AREA], int quality);
 
+/* Calculate spatial variance of an 8x8 pixel block */
+uint32_t calc_block_variance_u8(const uint8_t *pixels, uint32_t stride, uint32_t width, uint32_t height, uint32_t px0, uint32_t py0);
+
 /* Quantize and dequantize 8x8 transform coefficients */
 void quantize_block(const int32_t in_coeff[BLOCK_AREA], const uint16_t qmatrix[BLOCK_AREA], int16_t out_quant[BLOCK_AREA]);
+void quantize_block_aq(const int32_t in_coeff[BLOCK_AREA], const uint16_t qmatrix[BLOCK_AREA], uint32_t variance, int16_t out_quant[BLOCK_AREA]);
 void dequantize_block(const int16_t in_quant[BLOCK_AREA], const uint16_t qmatrix[BLOCK_AREA], int32_t out_coeff[BLOCK_AREA]);
 
 /* Zigzag reordering */

@@ -113,10 +113,10 @@ Pure mathematical metrics like Mean Squared Error (MSE) optimize for raw pixel d
 | **Block Partitioning** | Recursive Quadtree / QTBT ($4\times4$ to $128\times128$) | Fixed uniform $8\times8$ block grid |
 | **Prediction Modes** | Multi-angle Intra (35–67 angles) + Subpel Inter | Intra level-shift (-128) + Full-pel SAD Block Matching |
 | **Transform** | Multi-kernel Integer DCT / DST ($4\times4$ to $64\times64$) | 13-bit Fixed-Point $8\times8$ Separable 2D DCT |
-| **Quantization** | Scalar QP with RDOQ (Rate-Distortion Optimized) | Scaled JPEG matrix with Dead-Zone Thresholding ($\frac{5q}{8}$) |
+| **Quantization** | Scalar QP with RDOQ (Rate-Distortion Optimized) | Scaled JPEG matrix with Variance-Adaptive Dead-Zone Quantization (AQ) |
 | **Entropy Coding** | CABAC / ANS with dynamic context modeling | Run-Length (RLE) + Min-Heap Dynamic Huffman Coding |
 | **In-Loop Filtering** | Deblocking Filter, SAO, CDEF | Adaptive 8x8 Boundary Deblocking Filter (QP-scaled) |
-| **Mode Decision** | Full Lagrangian RDO ($J = D + \lambda \cdot R$) | Minimum SAD comparison for I- vs. P-block selection |
+| **Mode Decision** | Full Lagrangian RDO ($J = D + \lambda \cdot R$) | Lagrangian Rate-Distortion Optimization ($J = \text{SSE} + \lambda \cdot R$) |
 | **Container Format** | MP4 (ISOBMFF) / MKV / WebM | Native `.vc` container with seek index + MP4 wrapper |
 
 ---
@@ -222,9 +222,47 @@ Quantization at $8\times8$ block boundaries produces step discontinuities (block
 
 ---
 
+#### Lagrangian Rate-Distortion Optimization (RDO)
+Static SAD thresholds fail to account for bitrate cost at different quantization steps. An insignificant change in residual might cost 60 bits to transmit while barely impacting perception, or conversely, a delicate texture at high quality might be erroneously skipped.
+
+`vcompress` implements **Lagrangian RDO block decision** in inter-prediction ([`src/encoder.c`](file:///c:/Users/ADMIN/Documents/file_compression/src/encoder.c)):
+- **Cost Formulation**: Solves the Lagrangian optimization for each $8\times8$ candidate block:
+  $$J = D + \lambda \cdot R$$
+- **Distortion Evaluation ($D$)**:
+  - $D_{\text{skip}}$: $\text{SSE} = \sum (I_{\text{cur}} - I_{\text{ref}})^2$
+  - $D_{\text{coded}}$: $\text{SSE} = \sum (I_{\text{cur}} - I_{\text{recon}})^2$
+- **Rate Estimation ($R$)**:
+  - $R_{\text{skip}} = 1\text{ bit}$ (skip flag in P-frame header).
+  - $R_{\text{coded}} = 1\text{ bit} + \sum (\text{Huffman\_Length}(\text{run}, \text{cat}) + \text{cat})$ estimated from zigzag RLE symbols.
+- **Adaptive Multiplier ($\lambda$)**:
+  $$\lambda = \max\left(1, \frac{Q_{\text{avg}}^2}{16}\right)$$
+  Dynamically balances bitrate and distortion: at high quality (low $Q$), $\lambda$ is small, investing bits into subtle residual details; at low quality (high $Q$), $\lambda$ is large, penalizing wasteful bit expenditure.
+
+---
+
+#### Variance-Adaptive Quantization (AQ)
+Static quantization thresholds suffer from color banding (false contouring) in smooth gradients and wasteful bit allocation in busy textures.
+
+`vcompress` implements **Variance-Adaptive Quantization (AQ)** (`compressor.c:quantize_block_aq`):
+- **Numerically Stable Block Variance**:
+  Calculates local spatial variance across each $8\times8$ block:
+  $$\mu = \frac{1}{64}\sum x_i, \quad \sigma_b^2 = \frac{1}{64}\sum (x_i - \mu)^2$$
+- **Smooth Areas ($\sigma_b^2 < 25$)**:
+  Employs a narrowed dead-zone ($\frac{3}{8} q$) with mid-tread rounding ($\frac{4}{8} q$). Subtle gradient harmonics survive quantization instead of truncating to zero, eliminating Mach bands / stepped false contouring.
+- **Complex Textures ($\sigma_b^2 > 140$)**:
+  Employs an expanded dead-zone ($\frac{6}{8} q$) with aggressive truncation ($\frac{2}{8} q$). Prunes imperceptible high-frequency noise concealed by human visual texture masking, creating longer zero-runs and boosting compression efficiency.
+- **Decoder Independence**:
+  Because dequantization operates via standard scalar indices ($c_{\text{dequant}} = c_q \times q$), the decoder requires no syntax modifications while reference frames remain bit-identical.
+
+---
+
 ## 5. Architectural Roadmap
 
-Future feature work planned for the `vcompress` pipeline:
+All primary core hybrid video coding architectural improvements have been successfully implemented:
 1. **[x] In-Loop Deblocking Filter**: QP-adaptive boundary smoothing across $8\times8$ block borders before writing to reference buffers.
-2. **[ ] Lagrangian Mode Decision ($J = D + \lambda \cdot R$)**: Integrating bit estimates into block mode selection rather than raw SAD alone.
-3. **[ ] Adaptive Quantization (AQ)**: Modulating block-level $Q_{\text{step}}$ based on local spatial variance to mitigate color banding in smooth gradients.
+2. **[x] Lagrangian Mode Decision ($J = D + \lambda \cdot R$)**: Integrating bit estimates into block mode selection rather than raw SAD alone.
+3. **[x] Adaptive Quantization (AQ)**: Modulating block-level dead-zone and rounding based on local spatial variance to eliminate banding in smooth gradients and maximize compression in textures.
+
+Future exploratory milestones:
+- **Subpixel Motion Estimation**: Half-pel and quarter-pel interpolation.
+- **Variable Block Partitioning**: Recursive splitting into $4\times4$ sub-blocks.
